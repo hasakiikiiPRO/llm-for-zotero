@@ -1,4 +1,4 @@
-import { renderMarkdown, renderMarkdownForNote } from "../../utils/markdown";
+import { renderMarkdown, renderMarkdownForNote, renderMarkdownStreaming } from "../../utils/markdown";
 import { getWelcomeHtml, getWebChatWelcomeHtml, getStandaloneLibraryChatStartPageHtml, getPaperChatStartPageHtml, getNoteEditingStartPageHtml } from "../../utils/i18n";
 import {
   appendMessage as appendStoredMessage,
@@ -158,6 +158,82 @@ import {
   retryAgentTurn,
   type AgentEngineDeps,
 } from "./agentMode/agentEngine";
+
+// Cache rendered HTML for completed (non-streaming) messages to avoid
+// re-running renderMarkdown (+ KaTeX) on every 50ms refresh cycle.
+// WeakMap means entries are GC'd automatically when Message objects are dropped.
+const renderedHtmlCache = new WeakMap<Message, string>();
+const renderedReasoningSummaryCache = new WeakMap<Message, string>();
+const renderedReasoningDetailsCache = new WeakMap<Message, string>();
+// Track the msg.text snapshot at which citation decoration was last applied.
+// Citation decoration walks the entire Zotero library per blockquote and is
+// the dominant CPU cost during refresh. Skip it when text hasn't changed.
+const citationDecoratedTextCache = new WeakMap<Message, string>();
+
+// Cache sanitizeText() output per (message, field). sanitizeText runs a
+// per-character loop over the raw string; for unchanged messages this was
+// repeated on every refresh. Keyed by raw text identity.
+type SanitizeFieldKey = "text" | "reasoningSummary" | "reasoningDetails";
+const sanitizedTextCache = new WeakMap<
+  Message,
+  Partial<Record<SanitizeFieldKey, { raw: string; clean: string }>>
+>();
+function getCachedSanitized(msg: Message, field: SanitizeFieldKey): string {
+  const raw = (msg[field] as string | undefined) || "";
+  let bucket = sanitizedTextCache.get(msg);
+  if (bucket) {
+    const entry = bucket[field];
+    if (entry && entry.raw === raw) return entry.clean;
+  } else {
+    bucket = {};
+    sanitizedTextCache.set(msg, bucket);
+  }
+  const clean = sanitizeText(raw);
+  bucket[field] = { raw, clean };
+  return clean;
+}
+
+/** Clear all render caches for a message (call when message text is mutated after streaming). */
+function invalidateMessageRenderCache(msg: Message): void {
+  renderedHtmlCache.delete(msg);
+  renderedReasoningSummaryCache.delete(msg);
+  renderedReasoningDetailsCache.delete(msg);
+  citationDecoratedTextCache.delete(msg);
+}
+
+/** Get or compute cached rendered HTML for a completed message. */
+function getCachedRenderedHtml(
+  msg: Message,
+  safeText: string,
+  resolveImage?: (src: string) => string | null,
+): string {
+  if (!renderedHtmlCache.has(msg)) {
+    renderedHtmlCache.set(msg, renderMarkdown(safeText, { resolveImage }));
+  }
+  return renderedHtmlCache.get(msg)!;
+}
+
+/** Get or compute cached rendered HTML for reasoning summary. */
+function getCachedReasoningSummaryHtml(msg: Message): string {
+  if (!renderedReasoningSummaryCache.has(msg)) {
+    renderedReasoningSummaryCache.set(
+      msg,
+      renderMarkdown(msg.reasoningSummary || ""),
+    );
+  }
+  return renderedReasoningSummaryCache.get(msg)!;
+}
+
+/** Get or compute cached rendered HTML for reasoning details. */
+function getCachedReasoningDetailsHtml(msg: Message): string {
+  if (!renderedReasoningDetailsCache.has(msg)) {
+    renderedReasoningDetailsCache.set(
+      msg,
+      renderMarkdown(msg.reasoningDetails || ""),
+    );
+  }
+  return renderedReasoningDetailsCache.get(msg)!;
+}
 
 /** Get AbortController constructor from global scope */
 function getAbortControllerCtor(): new () => AbortController {
@@ -474,20 +550,29 @@ function getUserBubbleElement(wrapper: HTMLElement): HTMLDivElement | null {
 export function syncUserContextAlignmentWidths(body: Element): void {
   const chatBox = body.querySelector("#llm-chat-box") as HTMLDivElement | null;
   if (!chatBox) return;
-  const wrappers = Array.from(
-    chatBox.querySelectorAll(
-      ".llm-message-wrapper.user.llm-user-context-aligned",
-    ),
-  ) as HTMLDivElement[];
+  const wrappers = chatBox.querySelectorAll(
+    ".llm-message-wrapper.user.llm-user-context-aligned",
+  ) as NodeListOf<HTMLDivElement>;
+  if (wrappers.length === 0) return;
+  // Two-pass to avoid layout thrash: first read every bubble width (single
+  // batched layout phase), then write every CSS variable. Mixing read+write
+  // per-iteration would force one layout reflow PER wrapper.
+  type Pending = { wrapper: HTMLDivElement; width: number };
+  const pending: Pending[] = [];
   for (const wrapper of wrappers) {
     const bubble = getUserBubbleElement(wrapper);
     if (!bubble) {
-      wrapper.style.removeProperty("--llm-user-bubble-width");
+      pending.push({ wrapper, width: 0 });
       continue;
     }
-    const bubbleWidth = Math.round(bubble.getBoundingClientRect().width);
-    if (bubbleWidth > 0) {
-      wrapper.style.setProperty("--llm-user-bubble-width", `${bubbleWidth}px`);
+    pending.push({
+      wrapper,
+      width: Math.round(bubble.getBoundingClientRect().width),
+    });
+  }
+  for (const { wrapper, width } of pending) {
+    if (width > 0) {
+      wrapper.style.setProperty("--llm-user-bubble-width", `${width}px`);
     } else {
       wrapper.style.removeProperty("--llm-user-bubble-width");
     }
@@ -587,38 +672,53 @@ export function withScrollGuard(
     fn();
     return;
   }
-  // Capture current state before mutations.
-  const wasNearBottom = isNearBottom(chatBox);
-  const savedScrollTop = chatBox.scrollTop;
-  const savedMaxScrollTop = getMaxScrollTop(chatBox);
+  // Batch ALL pre-mutation DOM reads into a single layout phase. Reading
+  // scrollHeight / scrollTop / clientHeight individually would normally each
+  // trigger a forced reflow if interleaved with writes; doing them back-to-back
+  // here keeps it to one layout pass.
+  const preScrollTop = chatBox.scrollTop;
+  const preScrollHeight = chatBox.scrollHeight;
+  const preClientHeight = chatBox.clientHeight;
+  const preMaxScrollTop = Math.max(0, preScrollHeight - preClientHeight);
+  const wasNearBottom =
+    preScrollHeight - preClientHeight - preScrollTop <=
+    AUTO_SCROLL_BOTTOM_THRESHOLD;
 
   _scrollUpdatesSuspended = true;
   try {
     fn();
   } finally {
-    // Restore: if the user was at the bottom, stick there;
-    // otherwise restore either exact pixel offset or relative position.
+    // After fn() the DOM is dirty; restoring scroll is unavoidable but we
+    // minimize the number of post-mutation reads to a single layout pass.
     if (wasNearBottom) {
+      // No read needed if we just want to stick to bottom; one read + write.
       chatBox.scrollTop = chatBox.scrollHeight;
-    } else if (restoreMode === "relative" && savedMaxScrollTop > 0) {
-      const nextMaxScrollTop = getMaxScrollTop(chatBox);
+    } else if (restoreMode === "relative" && preMaxScrollTop > 0) {
+      const nextMaxScrollTop = Math.max(
+        0,
+        chatBox.scrollHeight - chatBox.clientHeight,
+      );
       const progress = Math.min(
         1,
-        Math.max(0, savedScrollTop / savedMaxScrollTop),
+        Math.max(0, preScrollTop / preMaxScrollTop),
       );
       chatBox.scrollTop = Math.round(nextMaxScrollTop * progress);
     } else {
-      chatBox.scrollTop = savedScrollTop;
+      chatBox.scrollTop = preScrollTop;
     }
-    // Persist only when the viewport is visible; hidden/collapsed layout
-    // phases can report transient top positions and would corrupt snapshots.
-    if (isChatViewportVisible(chatBox)) {
-      persistChatScrollSnapshotByKey(conversationKey, chatBox);
-    }
-    // Keep the guard up through the microtask so that any synchronous
-    // scroll events dispatched by the above writes are also suppressed.
+    // Defer the persist-snapshot work (which itself does several DOM reads
+    // including getClientRects) to a microtask AFTER the current paint, so it
+    // doesn't extend the synchronous critical path. Snapshot accuracy is
+    // unaffected — it'll capture the just-restored state.
     Promise.resolve().then(() => {
       _scrollUpdatesSuspended = false;
+      try {
+        if (isChatViewportVisible(chatBox)) {
+          persistChatScrollSnapshotByKey(conversationKey, chatBox);
+        }
+      } catch {
+        // ignore
+      }
     });
   }
 }
@@ -1440,7 +1540,7 @@ function createQueuedRefresh(refresh: () => void): () => void {
     setTimeout(() => {
       refreshQueued = false;
       refresh();
-    }, 50);
+    }, 10000);
   };
 }
 
@@ -3539,6 +3639,201 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
       }, 450);
     }
   }
+  // ── Streaming fast-path ──────────────────────────────────────────────────
+  // When a message is actively streaming and the chatBox already has rendered
+  // content, avoid tearing down and rebuilding all DOM nodes. Instead, locate
+  // the streaming bubble and update only its text / reasoning sub-elements.
+  // Fall through to the full rebuild when:
+  //   • the chatBox is empty (first render), or
+  //   • the streaming bubble isn't in the DOM yet, or
+  //   • reasoning elements appeared for the first time (structural change).
+  const streamingMsg = history.find((m) => m.streaming);
+  if (streamingMsg && hasExistingRenderedContent) {
+    const streamingBubble = chatBox.querySelector<HTMLElement>("[data-llm-streaming]");
+    if (streamingBubble) {
+      const hasSummary = Boolean(streamingMsg.reasoningSummary?.trim());
+      const hasDetails = Boolean(streamingMsg.reasoningDetails?.trim());
+      const summaryEl = streamingBubble.querySelector<HTMLElement>("[data-llm-reasoning-summary]");
+      const detailsEl = streamingBubble.querySelector<HTMLElement>("[data-llm-reasoning-details]");
+      // Only fast-path if reasoning structure is already in DOM (or not needed)
+      if ((!hasSummary || summaryEl) && (!hasDetails || detailsEl)) {
+        // Bypass withScrollGuard entirely — it does multiple scrollHeight/scrollTop
+        // reads that each force a synchronous layout reflow, which is the main
+        // source of lag. Instead: one read + one conditional write = one reflow max.
+        // streamingMsg.text is built by appending sanitizeText(delta) per chunk
+        // (see callLLMStream onDelta), so it is already sanitized — skip re-sanitize.
+        // Append-only updates: re-setting `textContent` to the full
+        // accumulated string on every refresh tears down the existing text
+        // node and lays out the entire (possibly thousands-of-chars)
+        // string from scratch each time. With reasoning that's been growing
+        // for 10+ seconds, that's the dominant per-tick cost. Track the
+        // length already in the DOM via dataset and append only the delta.
+        const appendOnly = (
+          el: HTMLElement,
+          fullText: string,
+        ): void => {
+          const prevLenStr = el.dataset.llmTextLen;
+          const prevLen = prevLenStr ? Number(prevLenStr) : 0;
+          if (
+            !Number.isFinite(prevLen) ||
+            prevLen < 0 ||
+            prevLen > fullText.length ||
+            // Sanity: if text shrunk or diverged, fall back to full reset.
+            (prevLen > 0 && fullText.slice(0, prevLen) !== el.textContent)
+          ) {
+            el.textContent = fullText;
+            el.dataset.llmTextLen = String(fullText.length);
+            return;
+          }
+          if (prevLen === fullText.length) return; // no new text
+          el.appendChild(
+            doc.createTextNode(fullText.slice(prevLen)),
+          );
+          el.dataset.llmTextLen = String(fullText.length);
+        };
+
+        const safeText = streamingMsg.text || "";
+        if (safeText) {
+          let textDiv = streamingBubble.querySelector<HTMLElement>("[data-llm-bubble-text]");
+          if (!textDiv) {
+            textDiv = doc.createElement("div") as HTMLDivElement;
+            (textDiv as HTMLElement).dataset.llmBubbleText = "true";
+            (textDiv as HTMLElement).className = "llm-bubble-streaming-text";
+            streamingBubble.appendChild(textDiv);
+          }
+          appendOnly(textDiv, safeText);
+        }
+        if (summaryEl && streamingMsg.reasoningSummary) {
+          appendOnly(summaryEl, streamingMsg.reasoningSummary);
+        }
+        if (detailsEl && streamingMsg.reasoningDetails) {
+          appendOnly(detailsEl, streamingMsg.reasoningDetails);
+        }
+        // Auto-scroll to bottom if user was near the bottom (single reflow).
+        const distFromBottom = chatBox.scrollHeight - chatBox.clientHeight - chatBox.scrollTop;
+        if (distFromBottom <= AUTO_SCROLL_BOTTOM_THRESHOLD) {
+          chatBox.scrollTop = chatBox.scrollHeight;
+        }
+        return; // ← skip full DOM rebuild
+      }
+    }
+  }
+  // ── End streaming fast-path ──────────────────────────────────────────────
+
+  // ── Post-stream in-place upgrade fast-path ───────────────────────────────
+  // When streaming JUST ended, the previous refresh left a [data-llm-streaming]
+  // bubble holding plain text. The default path here would `chatBox.innerHTML
+  // = ""` and rebuild every message bubble, even though only ONE bubble's
+  // content actually needs to change (plain text → rendered markdown). With a
+  // long history this rebuild is the visible "format-applied" spike. Instead:
+  // upgrade that single bubble in place — render markdown, swap content, drop
+  // streaming markers — and return early. Citation decoration runs deferred
+  // (already setTimeout 0 in the citation block below — but full rebuild is
+  // skipped, so we kick it off explicitly here).
+  if (!streamingMsg && hasExistingRenderedContent) {
+    const lingering = chatBox.querySelector<HTMLElement>("[data-llm-streaming]");
+    const lastMsg = history.length ? history[history.length - 1] : null;
+    if (
+      lingering &&
+      lastMsg &&
+      lastMsg.role === "assistant" &&
+      !lastMsg.streaming &&
+      lingering.dataset.llmMsgTs === String(Math.floor(lastMsg.timestamp || 0))
+    ) {
+      // Eagerly mark the bubble as no-longer-streaming so subsequent refresh
+      // calls (which may fire while we're still pending the upgrade) see the
+      // upgraded state and skip re-entering this block.
+      delete lingering.dataset.llmStreaming;
+      lingering.classList.remove("streaming");
+      const win = body.ownerDocument?.defaultView;
+
+      // Defer the heavy markdown render + innerHTML swap to the NEXT animation
+      // frame so the browser paints the streaming bubble's final plain-text
+      // state first. The render still costs the same wall-clock, but it's
+      // decoupled from the stream-end tick: the user sees a smooth handoff
+      // (last streaming frame paints → one frame later, formatted version
+      // replaces it) instead of "stream ends and UI freezes simultaneously".
+      const runUpgrade = () => {
+        try {
+          const ctxSrc = resolveContextSourceItem(item);
+          const ctxItem = ctxSrc.contextItem;
+          const pdfCtx = ctxItem ? pdfTextCache.get(ctxItem.id) : null;
+          const resolveImage =
+            pdfCtx?.sourceType === "mineru" && ctxItem
+              ? buildImageResolver(ctxItem.id)
+              : undefined;
+          const safeText = getCachedSanitized(lastMsg, "text");
+          const html = getCachedRenderedHtml(lastMsg, safeText, resolveImage);
+          const textDiv =
+            lingering.querySelector<HTMLElement>("[data-llm-bubble-text]");
+          if (textDiv) {
+            textDiv.outerHTML = html;
+          } else {
+            lingering.innerHTML = html;
+          }
+          const summaryEl = lingering.querySelector<HTMLElement>(
+            "[data-llm-reasoning-summary]",
+          );
+          if (summaryEl && lastMsg.reasoningSummary) {
+            summaryEl.innerHTML = getCachedReasoningSummaryHtml(lastMsg);
+            delete summaryEl.dataset.llmReasoningSummary;
+          }
+          const detailsEl = lingering.querySelector<HTMLElement>(
+            "[data-llm-reasoning-details]",
+          );
+          if (detailsEl && lastMsg.reasoningDetails) {
+            detailsEl.innerHTML = getCachedReasoningDetailsHtml(lastMsg);
+            delete detailsEl.dataset.llmReasoningDetails;
+          }
+          // Citation decoration deferred a further macrotask so it doesn't
+          // share a frame with the markdown render.
+          const lastDecoratedText = citationDecoratedTextCache.get(lastMsg);
+          if (lastDecoratedText !== lastMsg.text) {
+            citationDecoratedTextCache.set(lastMsg, lastMsg.text);
+            const pairedUserMessage =
+              history.length >= 2 &&
+              history[history.length - 2]?.role === "user"
+                ? history[history.length - 2]
+                : null;
+            const runDecorate = () => {
+              try {
+                decorateAssistantCitationLinks({
+                  body,
+                  panelItem: item,
+                  bubble: lingering as HTMLDivElement,
+                  assistantMessage: lastMsg,
+                  pairedUserMessage,
+                });
+              } catch (e) {
+                ztoolkit.log("LLM citation decoration error:", e);
+              }
+            };
+            if (win && typeof win.setTimeout === "function") {
+              win.setTimeout(runDecorate, 0);
+            } else {
+              setTimeout(runDecorate, 0);
+            }
+          }
+        } catch (err) {
+          ztoolkit.log("LLM post-stream upgrade (deferred) error:", err);
+        }
+      };
+      try {
+        if (win && typeof win.requestAnimationFrame === "function") {
+          win.requestAnimationFrame(runUpgrade);
+        } else if (win && typeof win.setTimeout === "function") {
+          win.setTimeout(runUpgrade, 0);
+        } else {
+          setTimeout(runUpgrade, 0);
+        }
+      } catch {
+        runUpgrade();
+      }
+      return; // ← skip full DOM rebuild; upgrade runs in next frame
+    }
+  }
+  // ── End post-stream upgrade fast-path ────────────────────────────────────
+
   chatBox.innerHTML = "";
 
   const latestRetryPair = findLatestRetryPair(history);
@@ -3570,6 +3865,12 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
 
     const bubble = doc.createElement("div") as HTMLDivElement;
     bubble.className = `llm-bubble ${isUser ? "user" : "assistant"}`;
+    // Mark assistant streaming bubble here (before hasAnswerText check) so the
+    // fast-path can find it even when text is still empty (reasoning-only phase).
+    if (!isUser && msg.streaming) bubble.dataset.llmStreaming = "true";
+    // Tag every bubble with its message timestamp so the post-stream upgrade
+    // fast-path can locate the just-finished bubble without rebuilding all DOM.
+    bubble.dataset.llmMsgTs = String(Math.floor(msg.timestamp || 0));
     let inlineEditEl: HTMLElement | null = null;
 
     if (isUser) {
@@ -4073,7 +4374,7 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
           conversationKey,
         );
       } else {
-        renderUserBubbleContent(bubble, sanitizeText(msg.text || ""), doc);
+        renderUserBubbleContent(bubble, getCachedSanitized(msg, "text"), doc);
         if (canEditUserPrompt) {
           bubble.classList.add("llm-bubble-editable");
           bubble.addEventListener("click", (e: Event) => {
@@ -4170,8 +4471,12 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
             })
           : null;
       if (hasAnswerText) {
-        const safeText = sanitizeText(msg.text);
-        if (msg.streaming) bubble.classList.add("streaming");
+        const safeText = getCachedSanitized(msg, "text");
+        if (msg.streaming) {
+          bubble.classList.add("streaming");
+          // Mark for fast-path DOM update (avoids full chatBox rebuild each tick)
+          bubble.dataset.llmStreaming = "true";
+        }
         try {
           // Build image resolver for MinerU figures (if applicable)
           const contextSource = resolveContextSourceItem(item);
@@ -4180,35 +4485,63 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
           const resolveImage = pdfCtx?.sourceType === "mineru" && ctxItem
             ? buildImageResolver(ctxItem.id)
             : undefined;
-          bubble.innerHTML = renderMarkdown(safeText, { resolveImage });
+          if (msg.streaming) {
+            // Plain text only during streaming — zero markdown/regex cost.
+            // Full markdown + KaTeX renders once when streaming ends (via cache).
+            const textDiv = doc.createElement("div") as HTMLDivElement;
+            textDiv.dataset.llmBubbleText = "true";
+            textDiv.className = "llm-bubble-streaming-text";
+            textDiv.textContent = safeText;
+            bubble.appendChild(textDiv);
+          } else {
+            bubble.innerHTML = getCachedRenderedHtml(msg, safeText, resolveImage);
+          }
         } catch (err) {
           ztoolkit.log("LLM render error:", err);
           bubble.textContent = safeText;
         }
         if (!msg.streaming) {
-          try {
+          // Skip citation decoration entirely while ANY message is streaming —
+          // the unthrottled end-of-stream refresh (chat.ts ~3142) decorates once
+          // when streaming=false. Also skip when text hasn't changed since the
+          // last decoration (cache by msg.text snapshot). This avoids re-running
+          // searchPaperCandidates over the full Zotero library on every refresh,
+          // which the profiler showed dominated CPU (~32% inclusive).
+          const anyStreaming = history.some((m) => m.streaming);
+          const lastDecoratedText = citationDecoratedTextCache.get(msg);
+          if (!anyStreaming && lastDecoratedText !== msg.text) {
+            // Defer the full-library citation search to the next macrotask so
+            // the rendered markdown bubble paints first. Otherwise the heavy
+            // searchPaperCandidates (per-blockquote library scan) runs in the
+            // same synchronous tick as KaTeX/markdown render, producing the
+            // visible end-of-stream spike. Mark cache eagerly to suppress
+            // duplicate scheduling across refreshes.
+            citationDecoratedTextCache.set(msg, msg.text);
             const pairedUserMessage =
               history[index - 1]?.role === "user" ? history[index - 1] : null;
-            ztoolkit.log(
-              "LLM: calling decorateAssistantCitationLinks",
-              "msgLen =",
-              msg.text.length,
-              "bubbleHTML =",
-              String(bubble.innerHTML || "").length,
-              "hasPairedUser =",
-              Boolean(pairedUserMessage),
-              "pairedPaperContexts =",
-              pairedUserMessage?.paperContexts?.length ?? "none",
-            );
-            decorateAssistantCitationLinks({
-              body,
-              panelItem: item,
-              bubble,
-              assistantMessage: msg,
-              pairedUserMessage,
-            });
-          } catch (decorateErr) {
-            ztoolkit.log("LLM citation decoration error:", decorateErr);
+            const win = body.ownerDocument?.defaultView;
+            const runDecorate = () => {
+              try {
+                decorateAssistantCitationLinks({
+                  body,
+                  panelItem: item,
+                  bubble,
+                  assistantMessage: msg,
+                  pairedUserMessage,
+                });
+              } catch (e) {
+                ztoolkit.log("LLM citation decoration error:", e);
+              }
+            };
+            try {
+              if (win && typeof win.setTimeout === "function") {
+                win.setTimeout(runDecorate, 0);
+              } else {
+                setTimeout(runDecorate, 0);
+              }
+            } catch (decorateErr) {
+              ztoolkit.log("LLM citation decoration error:", decorateErr);
+            }
           }
         }
         bubble.addEventListener("contextmenu", (e: Event) => {
@@ -4326,8 +4659,13 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
           label.textContent = "Summary";
           const text = doc.createElement("div") as HTMLDivElement;
           text.className = "llm-agent-reasoning-text";
+          if (msg.streaming) text.dataset.llmReasoningSummary = "true";
           try {
-            text.innerHTML = renderMarkdown(msg.reasoningSummary || "");
+            if (msg.streaming) {
+              text.textContent = msg.reasoningSummary || "";
+            } else {
+              text.innerHTML = getCachedReasoningSummaryHtml(msg);
+            }
           } catch (err) {
             ztoolkit.log("LLM reasoning render error:", err);
             text.textContent = msg.reasoningSummary || "";
@@ -4344,8 +4682,13 @@ export function refreshChat(body: Element, item?: Zotero.Item | null) {
           label.textContent = "Details";
           const text = doc.createElement("div") as HTMLDivElement;
           text.className = "llm-agent-reasoning-text";
+          if (msg.streaming) text.dataset.llmReasoningDetails = "true";
           try {
-            text.innerHTML = renderMarkdown(msg.reasoningDetails || "");
+            if (msg.streaming) {
+              text.textContent = msg.reasoningDetails || "";
+            } else {
+              text.innerHTML = getCachedReasoningDetailsHtml(msg);
+            }
           } catch (err) {
             ztoolkit.log("LLM reasoning render error:", err);
             text.textContent = msg.reasoningDetails || "";

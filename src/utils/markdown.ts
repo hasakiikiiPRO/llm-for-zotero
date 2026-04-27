@@ -50,6 +50,13 @@ interface TextBlock {
  * unlike the paste handler which can transform KaTeX/MathML on the fly.
  */
 let zoteroNoteMode = false;
+/**
+ * When true, skip KaTeX rendering entirely and emit raw LaTeX source wrapped
+ * in a lightweight <code> tag. Used during streaming to avoid blocking the
+ * main thread with expensive KaTeX calls on every 50 ms refresh cycle.
+ * Math is rendered properly (via the cache) once streaming ends.
+ */
+let streamingMode = false;
 let activeImageResolver: ((src: string) => string | null) | null = null;
 
 // =============================================================================
@@ -101,6 +108,11 @@ function escapeRegex(str: string): string {
 
 /** Render LaTeX to HTML using KaTeX */
 function renderLatex(latex: string, displayMode: boolean): string {
+  if (streamingMode) {
+    // Skip KaTeX during streaming to keep the main thread unblocked.
+    const delim = displayMode ? "$$" : "$";
+    return `<code class="math-streaming">${escapeHtml(delim + latex.trim() + delim)}</code>`;
+  }
   try {
     return katex.renderToString(latex, { ...KATEX_OPTIONS, displayMode });
   } catch {
@@ -613,6 +625,10 @@ function renderMathBlock(content: string): string {
     return `<pre class="math">$$${escapeHtml(math)}$$</pre>`;
   }
 
+  if (streamingMode) {
+    return `<pre class="math-streaming"><code>$$${escapeHtml(math)}$$</code></pre>`;
+  }
+
   const rendered = renderDisplayLatex(math);
   return `<div class="math-display">${rendered}</div>`;
 }
@@ -920,5 +936,25 @@ export function renderMarkdownForNote(text: string): string {
     return renderMarkdown(text);
   } finally {
     zoteroNoteMode = false;
+  }
+}
+
+/**
+ * Render markdown during streaming output.
+ *
+ * Identical to renderMarkdown but skips KaTeX — math is shown as raw LaTeX
+ * source in a <code> tag instead. This keeps the main thread unblocked during
+ * the 50 ms streaming refresh cycle. KaTeX is applied (via the render cache)
+ * only once, when streaming ends.
+ */
+export function renderMarkdownStreaming(
+  text: string,
+  options?: { resolveImage?: (src: string) => string | null },
+): string {
+  streamingMode = true;
+  try {
+    return renderMarkdown(text, options);
+  } finally {
+    streamingMode = false;
   }
 }
