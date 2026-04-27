@@ -1530,6 +1530,54 @@ async function resolvePageForCitationButton(params: {
   }
 }
 
+function updateCitationButtonPageFromCache(params: {
+  button: HTMLButtonElement;
+  displayCitationLabel: string;
+  candidates: AssistantCitationPaperCandidate[];
+  extractedCitation: ExtractedCitationLabel;
+  quoteText: string;
+}): boolean {
+  const normalizedQuoteText = sanitizeText(params.quoteText || "").trim();
+  if (!normalizedQuoteText) return false;
+  for (const candidate of params.candidates) {
+    if (rankCandidateForCitation(params.extractedCitation, candidate) === 0) {
+      continue;
+    }
+    const cached = citationPageCache.get(
+      buildCitationCacheKey(candidate.contextItemId, normalizedQuoteText),
+    );
+    if (!cached?.pageLabel) continue;
+    updateCitationButtonPage(
+      params.button,
+      params.displayCitationLabel,
+      cached.pageLabel,
+    );
+    return true;
+  }
+  return false;
+}
+
+function attachCitationPageLookupIntentHandlers(params: {
+  button: HTMLButtonElement;
+  displayCitationLabel: string;
+  candidates: AssistantCitationPaperCandidate[];
+  panelItem: Zotero.Item;
+  extractedCitation: ExtractedCitationLabel;
+  quoteText: string;
+}): void {
+  const startLookup = () => {
+    if (params.button.dataset.pageLookupStarted === "true") return;
+    if (!params.button.isConnected) return;
+    params.button.dataset.pageLookupStarted = "true";
+    void resolvePageForCitationButton(params);
+  };
+  params.button.addEventListener("pointerenter", startLookup, {
+    once: true,
+    passive: true,
+  });
+  params.button.addEventListener("focus", startLookup, { once: true });
+}
+
 /**
  * Dynamically resolve fallback candidates from the panel item / active reader
  * at interaction time.  This runs when the static candidate list from the user
@@ -2280,14 +2328,17 @@ function createCitationButton(params: {
 
   container.appendChild(citationButton);
 
-  void resolvePageForCitationButton({
+  const pageLookupParams = {
     button: citationButton,
     displayCitationLabel,
     candidates: params.candidates,
     panelItem: params.panelItem,
     extractedCitation: params.extractedCitation,
     quoteText: params.quoteText,
-  });
+  };
+  if (!updateCitationButtonPageFromCache(pageLookupParams)) {
+    attachCitationPageLookupIntentHandlers(pageLookupParams);
+  }
 
   return container;
 }

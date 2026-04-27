@@ -1,4 +1,4 @@
-import { renderMarkdown, renderMarkdownForNote, renderMarkdownStreaming } from "../../utils/markdown";
+import { renderMarkdown, renderMarkdownForNote } from "../../utils/markdown";
 import { getWelcomeHtml, getWebChatWelcomeHtml, getStandaloneLibraryChatStartPageHtml, getPaperChatStartPageHtml, getNoteEditingStartPageHtml } from "../../utils/i18n";
 import {
   appendMessage as appendStoredMessage,
@@ -162,9 +162,15 @@ import {
 // Cache rendered HTML for completed (non-streaming) messages to avoid
 // re-running renderMarkdown (+ KaTeX) on every 50ms refresh cycle.
 // WeakMap means entries are GC'd automatically when Message objects are dropped.
-const renderedHtmlCache = new WeakMap<Message, string>();
-const renderedReasoningSummaryCache = new WeakMap<Message, string>();
-const renderedReasoningDetailsCache = new WeakMap<Message, string>();
+const renderedHtmlCache = new WeakMap<Message, { raw: string; html: string }>();
+const renderedReasoningSummaryCache = new WeakMap<
+  Message,
+  { raw: string; html: string }
+>();
+const renderedReasoningDetailsCache = new WeakMap<
+  Message,
+  { raw: string; html: string }
+>();
 // Track the msg.text snapshot at which citation decoration was last applied.
 // Citation decoration walks the entire Zotero library per blockquote and is
 // the dominant CPU cost during refresh. Skip it when text hasn't changed.
@@ -207,32 +213,37 @@ function getCachedRenderedHtml(
   safeText: string,
   resolveImage?: (src: string) => string | null,
 ): string {
-  if (!renderedHtmlCache.has(msg)) {
-    renderedHtmlCache.set(msg, renderMarkdown(safeText, { resolveImage }));
+  const cached = renderedHtmlCache.get(msg);
+  if (cached?.raw === safeText) {
+    return cached.html;
   }
-  return renderedHtmlCache.get(msg)!;
+  const html = renderMarkdown(safeText, { resolveImage });
+  renderedHtmlCache.set(msg, { raw: safeText, html });
+  return html;
 }
 
 /** Get or compute cached rendered HTML for reasoning summary. */
 function getCachedReasoningSummaryHtml(msg: Message): string {
-  if (!renderedReasoningSummaryCache.has(msg)) {
-    renderedReasoningSummaryCache.set(
-      msg,
-      renderMarkdown(msg.reasoningSummary || ""),
-    );
+  const raw = msg.reasoningSummary || "";
+  const cached = renderedReasoningSummaryCache.get(msg);
+  if (cached?.raw === raw) {
+    return cached.html;
   }
-  return renderedReasoningSummaryCache.get(msg)!;
+  const html = renderMarkdown(raw);
+  renderedReasoningSummaryCache.set(msg, { raw, html });
+  return html;
 }
 
 /** Get or compute cached rendered HTML for reasoning details. */
 function getCachedReasoningDetailsHtml(msg: Message): string {
-  if (!renderedReasoningDetailsCache.has(msg)) {
-    renderedReasoningDetailsCache.set(
-      msg,
-      renderMarkdown(msg.reasoningDetails || ""),
-    );
+  const raw = msg.reasoningDetails || "";
+  const cached = renderedReasoningDetailsCache.get(msg);
+  if (cached?.raw === raw) {
+    return cached.html;
   }
-  return renderedReasoningDetailsCache.get(msg)!;
+  const html = renderMarkdown(raw);
+  renderedReasoningDetailsCache.set(msg, { raw, html });
+  return html;
 }
 
 /** Get AbortController constructor from global scope */
@@ -1540,7 +1551,7 @@ function createQueuedRefresh(refresh: () => void): () => void {
     setTimeout(() => {
       refreshQueued = false;
       refresh();
-    }, 10000);
+    }, 100);
   };
 }
 
@@ -4863,7 +4874,7 @@ export function refreshConversationPanels(
         syncPanelState?.();
       }
     };
-    if (chatBox) {
+    if (!includeChat && chatBox) {
       withScrollGuard(chatBox, conversationKey, updatePanel);
     } else {
       updatePanel();

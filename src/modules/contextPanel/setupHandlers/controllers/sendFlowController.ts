@@ -325,11 +325,12 @@ export function createSendFlowController(deps: SendFlowControllerDeps): {
         );
     const runtimeMode: ChatRuntimeMode = deps.isAgentMode() ? "agent" : "chat";
     // Check for command action metadata (set by handleInlineCommand for /command display)
-    const commandAction = deps.inputBox.dataset.commandAction;
-    const commandParams = deps.inputBox.dataset.commandParams ?? "";
+    const inputDataset = deps.inputBox.dataset || ({} as DOMStringMap);
+    const commandAction = inputDataset.commandAction;
+    const commandParams = inputDataset.commandParams ?? "";
     if (commandAction) {
-      delete deps.inputBox.dataset.commandAction;
-      delete deps.inputBox.dataset.commandParams;
+      delete inputDataset.commandAction;
+      delete inputDataset.commandParams;
     }
     const displayQuestion = commandAction
       ? (commandParams ? `/${commandAction} ${commandParams}` : `/${commandAction}`)
